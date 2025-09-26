@@ -55,6 +55,12 @@ struct _NdWindow
 
   GPtrArray             *sink_property_bindings;
 
+    GstElement            *video_selector;
+    GstElement            *real_video_src;
+    GstElement            *black_video_src;
+    GstPad                *real_pad;
+    GstPad                *black_pad;
+
   /* Template widgets */
   GtkStack        *has_providers_stack;
   GtkStack        *step_stack;
@@ -81,9 +87,37 @@ struct _NdWindow
   GListStore      *error_sink_list_model;
   GtkBox          *error_firewall_zone;
   GtkButton       *error_return;
+
+  GtkButton       *blank_button;
 };
 
 G_DEFINE_TYPE (NdWindow, gnome_nd_window, ADW_TYPE_APPLICATION_WINDOW)
+
+static void
+blank_button_clicked_cb (NdWindow *self)
+{
+    const gchar *current_label = gtk_button_get_label(self->blank_button);
+
+    GstPad *real_pad = g_object_get_data(G_OBJECT(self), "selector_real_pad");
+    GstPad *black_pad = g_object_get_data(G_OBJECT(self), "selector_black_pad");
+
+    if (g_strcmp0(current_label, _("Blank Screen")) == 0)
+    {
+        gtk_button_set_label(self->blank_button, _("Unblank Screen"));
+        g_debug("Screen blanked");
+
+        if (self->video_selector && black_pad)
+            g_object_set(self->video_selector, "active-pad", black_pad, NULL);
+    }
+    else
+    {
+        gtk_button_set_label(self->blank_button, _("Blank Screen"));
+        g_debug("Screen unblanked");
+
+        if (self->video_selector && real_pad)
+            g_object_set(self->video_selector, "active-pad", real_pad, NULL);
+    }
+}
 
 static GstElement *
 nd_window_screencast_get_source (NdWindow * self)
@@ -140,68 +174,91 @@ nd_window_screencast_get_source (NdWindow * self)
 static GstElement *
 sink_create_source_cb (NdWindow * self, NdSink * sink)
 {
-  g_autoptr(GstCaps) caps = NULL;
-  GstBin *bin;
-  GstElement *src, *filter, *dst, *res;
+    g_autoptr(GstCaps) caps = NULL;
+    GstBin *bin;
+    GstElement *src, *filter, *dst, *res;
+    GstElement *black_src, *selector;
+    GstPad *real_sink_pad, *black_sink_pad;
 
-  bin = GST_BIN (gst_bin_new ("screencast source bin"));
-  g_debug ("use x11: %d", self->use_x11);
-  if (self->use_x11)
-    src = gst_element_factory_make ("ximagesrc", "X11 screencast source");
-  else
-    src = nd_window_screencast_get_source (self);
+    bin = GST_BIN (gst_bin_new ("screencast source bin"));
+    g_debug ("use x11: %d", self->use_x11);
 
-  if (!src)
-    g_error ("Error creating video source element, likely a missing dependency!");
+    if (self->use_x11)
+        src = gst_element_factory_make ("ximagesrc", "X11 screencast source");
+    else
+        src = nd_window_screencast_get_source (self);
 
-  gst_bin_add (bin, src);
+    if (!src)
+        g_error ("Error creating video source element, likely a missing dependency!");
 
-  dst = gst_element_factory_make ("intervideosink", "inter video sink");
-  if (!dst)
-    g_error ("Error creating intervideosink, missing dependency!");
-  g_object_set (dst,
-                "channel", "nd-inter-video",
-                "max-lateness", (gint64) - 1,
-                "sync", FALSE,
-                NULL);
-  gst_bin_add (bin, dst);
+    gst_bin_add (bin, src);
+    self->real_video_src = src;
 
-  if (self->screencast_type == ND_SCREEN_CAST_SOURCE_TYPE_VIRTUAL)
-    {
-      /* Initial caps for virtual display */
-      caps = gst_caps_new_simple ("video/x-raw",
-                                  "max-framerate", GST_TYPE_FRACTION, 30, 1,
-                                  "width", G_TYPE_INT, 1920,
-                                  "height", G_TYPE_INT, 1080,
-                                  NULL);
-      filter = gst_element_factory_make ("capsfilter", "srcfilter");
-      gst_bin_add (bin, filter);
-      g_object_set (filter,
-                    "caps", caps,
-                    NULL);
-      g_clear_pointer (&caps, gst_caps_unref);
+    black_src = gst_element_factory_make ("videotestsrc", "black-screen-src");
+    if (!black_src)
+        g_error ("Error creating black-screen source!");
+    g_object_set (black_src, "pattern", 2, NULL); // solid black
+    gst_bin_add (bin, black_src);
+    self->black_video_src = black_src;
 
-      gst_element_link_many (src, filter, dst, NULL);
+    selector = gst_element_factory_make ("input-selector", "video-selector");
+    if (!selector)
+        g_error ("Error creating input-selector!");
+    gst_bin_add (bin, selector);
+    self->video_selector = selector;
+
+    if (self->screencast_type == ND_SCREEN_CAST_SOURCE_TYPE_VIRTUAL) {
+        caps = gst_caps_new_simple ("video/x-raw",
+                                    "max-framerate", GST_TYPE_FRACTION, 30, 1,
+                                    "width", G_TYPE_INT, 1920,
+                                    "height", G_TYPE_INT, 1080,
+                                    NULL);
+        filter = gst_element_factory_make ("capsfilter", "srcfilter");
+        if (!filter)
+            g_error ("Error creating capsfilter!");
+        gst_bin_add (bin, filter);
+        g_object_set (filter, "caps", caps, NULL);
+        g_clear_pointer (&caps, gst_caps_unref);
+
+        gst_element_link_many (src, filter, selector, NULL);
+    } else {
+        gst_element_link (src, selector);
     }
-  else
-    gst_element_link_many (src, dst, NULL);
 
-  res = gst_element_factory_make ("intervideosrc", "screencastsrc");
-  g_object_set (res,
-                "do-timestamp", FALSE,
-                "timeout", (guint64) G_MAXUINT64,
-                "channel", "nd-inter-video",
-                NULL);
+    gst_element_link (black_src, selector);
 
-  gst_bin_add (bin, res);
+    real_sink_pad = gst_element_get_static_pad (selector, "sink_0");
+    black_sink_pad = gst_element_get_static_pad (selector, "sink_1");
+    g_object_set_data (G_OBJECT(self), "selector_real_pad", real_sink_pad);
+    g_object_set_data (G_OBJECT(self), "selector_black_pad", black_sink_pad);
 
-  gst_element_add_pad (GST_ELEMENT (bin),
-                       gst_ghost_pad_new ("src",
-                                          gst_element_get_static_pad (res,
-                                                                      "src")));
+    dst = gst_element_factory_make ("intervideosink", "inter-video-sink");
+    if (!dst)
+        g_error ("Error creating intervideosink, missing dependency!");
+    g_object_set (dst,
+                  "channel", "nd-inter-video",
+                  "max-lateness", (gint64)-1,
+                  "sync", FALSE,
+                  NULL);
+    gst_bin_add (bin, dst);
+    gst_element_link (selector, dst);
 
-  g_object_ref_sink (bin);
-  return GST_ELEMENT (bin);
+    res = gst_element_factory_make ("intervideosrc", "screencastsrc");
+    if (!res)
+        g_error ("Error creating intervideosrc, missing dependency!");
+    g_object_set (res,
+                  "do-timestamp", FALSE,
+                  "timeout", (guint64)G_MAXUINT64,
+                  "channel", "nd-inter-video",
+                  NULL);
+    gst_bin_add (bin, res);
+
+    gst_element_add_pad (GST_ELEMENT(bin),
+                         gst_ghost_pad_new("src",
+                                           gst_element_get_static_pad(res, "src")));
+
+    g_object_ref_sink (bin);
+    return GST_ELEMENT(bin);
 }
 
 static GstElement *
@@ -571,6 +628,7 @@ gnome_nd_window_class_init (NdWindowClass *klass)
   gtk_widget_class_bind_template_child (widget_class, NdWindow, error_sink_list);
   gtk_widget_class_bind_template_child (widget_class, NdWindow, error_firewall_zone);
   gtk_widget_class_bind_template_child (widget_class, NdWindow, error_return);
+  gtk_widget_class_bind_template_child (widget_class, NdWindow, blank_button);
 }
 
 static void
@@ -688,6 +746,12 @@ gnome_nd_window_init (NdWindow *self)
                            (GCallback) stream_stop_clicked_cb,
                            self,
                            G_CONNECT_SWAPPED);
+
+    g_signal_connect_object(self->blank_button,
+                            "clicked",
+                            G_CALLBACK(blank_button_clicked_cb),
+                            self,
+                            G_CONNECT_SWAPPED);
 
   self->portal = xdp_portal_initable_new (&error);
   if (error)

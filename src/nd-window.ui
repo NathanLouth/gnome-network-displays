@@ -223,12 +223,17 @@
                                 </child>
                                 <child>
                                   <object class="GtkBox">
-                                    <child>
-                                      <placeholder/>
-                                    </child>
+                                    <property name="spacing">6</property> <!-- add spacing between buttons -->
                                     <child>
                                       <object class="GtkButton" id="stream_cancel">
                                         <property name="label" translatable="yes">Cancel</property>
+                                        <property name="focusable">True</property>
+                                        <property name="receives-default">True</property>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkButton" id="blank_button">
+                                        <property name="label" translatable="yes">Blank Screen</property>
                                         <property name="focusable">True</property>
                                         <property name="receives-default">True</property>
                                       </object>
