@@ -55,11 +55,8 @@ struct _NdWindow
 
   GPtrArray             *sink_property_bindings;
 
-    GstElement            *video_selector;
-    GstElement            *real_video_src;
-    GstElement            *black_video_src;
-    GstPad                *real_pad;
-    GstPad                *black_pad;
+  GstElement            *source_bin;
+  GstPad                *compositor_sink_pad;
 
   /* Template widgets */
   GtkStack        *has_providers_stack;
@@ -94,28 +91,23 @@ struct _NdWindow
 G_DEFINE_TYPE (NdWindow, gnome_nd_window, ADW_TYPE_APPLICATION_WINDOW)
 
 static void
-blank_button_clicked_cb (NdWindow *self)
+blank_button_clicked_cb(NdWindow *self)
 {
     const gchar *current_label = gtk_button_get_label(self->blank_button);
 
-    GstPad *real_pad = g_object_get_data(G_OBJECT(self), "selector_real_pad");
-    GstPad *black_pad = g_object_get_data(G_OBJECT(self), "selector_black_pad");
+    if (!self->compositor_sink_pad) {
+        g_warning("No compositor sink pad available");
+        return;
+    }
 
-    if (g_strcmp0(current_label, _("Blank Screen")) == 0)
-    {
+    if (g_strcmp0(current_label, _("Blank Screen")) == 0) {
         gtk_button_set_label(self->blank_button, _("Unblank Screen"));
         g_debug("Screen blanked");
-
-        if (self->video_selector && black_pad)
-            g_object_set(self->video_selector, "active-pad", black_pad, NULL);
-    }
-    else
-    {
+        g_object_set(self->compositor_sink_pad, "alpha", 0.0, NULL);
+    } else {
         gtk_button_set_label(self->blank_button, _("Blank Screen"));
         g_debug("Screen unblanked");
-
-        if (self->video_selector && real_pad)
-            g_object_set(self->video_selector, "active-pad", real_pad, NULL);
+        g_object_set(self->compositor_sink_pad, "alpha", 1.0, NULL);
     }
 }
 
@@ -172,93 +164,79 @@ nd_window_screencast_get_source (NdWindow * self)
 }
 
 static GstElement *
-sink_create_source_cb (NdWindow * self, NdSink * sink)
+sink_create_source_cb(NdWindow *self, NdSink *sink)
 {
-    g_autoptr(GstCaps) caps = NULL;
-    GstBin *bin;
-    GstElement *src, *filter, *dst, *res;
-    GstElement *black_src, *selector;
-    GstPad *real_sink_pad, *black_sink_pad;
+  g_autoptr(GstCaps) caps = NULL;
+  GstBin *bin;
+  GstElement *src, *filter, *compositor, *sink_elem, *src_out;
+  GstPad *compositor_sink_pad, *src_pad;
 
-    bin = GST_BIN (gst_bin_new ("screencast source bin"));
-    g_debug ("use x11: %d", self->use_x11);
+  bin = GST_BIN(gst_bin_new("screencast_source_bin"));
+  g_debug("use_x11: %d", self->use_x11);
 
-    if (self->use_x11)
-        src = gst_element_factory_make ("ximagesrc", "X11 screencast source");
-    else
-        src = nd_window_screencast_get_source (self);
+  if (self->use_x11)
+    src = gst_element_factory_make("ximagesrc", "x11src");
+  else
+    src = nd_window_screencast_get_source(self);
 
-    if (!src)
-        g_error ("Error creating video source element, likely a missing dependency!");
+  if (!src)
+    g_error("Failed to create video source. Missing dependency?");
 
-    gst_bin_add (bin, src);
-    self->real_video_src = src;
+  gst_bin_add(bin, src);
 
-    black_src = gst_element_factory_make ("videotestsrc", "black-screen-src");
-    if (!black_src)
-        g_error ("Error creating black-screen source!");
-    g_object_set (black_src, "pattern", 2, NULL); // solid black
-    gst_bin_add (bin, black_src);
-    self->black_video_src = black_src;
+  if (self->screencast_type == ND_SCREEN_CAST_SOURCE_TYPE_VIRTUAL) {
+    caps = gst_caps_new_simple("video/x-raw", "max-framerate", GST_TYPE_FRACTION, 30, 1, "width", G_TYPE_INT, 1920, "height", G_TYPE_INT, 1080, NULL);
 
-    selector = gst_element_factory_make ("input-selector", "video-selector");
-    if (!selector)
-        g_error ("Error creating input-selector!");
-    gst_bin_add (bin, selector);
-    self->video_selector = selector;
+    filter = gst_element_factory_make("capsfilter", "srcfilter");
+    g_object_set(filter, "caps", caps, NULL);
+    gst_bin_add(bin, filter);
 
-    if (self->screencast_type == ND_SCREEN_CAST_SOURCE_TYPE_VIRTUAL) {
-        caps = gst_caps_new_simple ("video/x-raw",
-                                    "max-framerate", GST_TYPE_FRACTION, 30, 1,
-                                    "width", G_TYPE_INT, 1920,
-                                    "height", G_TYPE_INT, 1080,
-                                    NULL);
-        filter = gst_element_factory_make ("capsfilter", "srcfilter");
-        if (!filter)
-            g_error ("Error creating capsfilter!");
-        gst_bin_add (bin, filter);
-        g_object_set (filter, "caps", caps, NULL);
-        g_clear_pointer (&caps, gst_caps_unref);
+    if (!gst_element_link(src, filter))
+      g_error("Failed to link src -> capsfilter");
+  } else {
+    filter = src;
+  }
 
-        gst_element_link_many (src, filter, selector, NULL);
-    } else {
-        gst_element_link (src, selector);
-    }
+  compositor = gst_element_factory_make("compositor", "compositor");
+  if (!compositor)
+    g_error("Failed to create compositor. Is it installed?");
+  gst_bin_add(bin, compositor);
 
-    gst_element_link (black_src, selector);
+  g_object_set(compositor, "background", TRUE, "background-color", 0xFF000000, NULL);
 
-    real_sink_pad = gst_element_get_static_pad (selector, "sink_0");
-    black_sink_pad = gst_element_get_static_pad (selector, "sink_1");
-    g_object_set_data (G_OBJECT(self), "selector_real_pad", real_sink_pad);
-    g_object_set_data (G_OBJECT(self), "selector_black_pad", black_sink_pad);
+  compositor_sink_pad = gst_element_get_request_pad(compositor, "sink_%u");
+  if (!compositor_sink_pad)
+    g_error("Failed to get sink pad from compositor");
 
-    dst = gst_element_factory_make ("intervideosink", "inter-video-sink");
-    if (!dst)
-        g_error ("Error creating intervideosink, missing dependency!");
-    g_object_set (dst,
-                  "channel", "nd-inter-video",
-                  "max-lateness", (gint64)-1,
-                  "sync", FALSE,
-                  NULL);
-    gst_bin_add (bin, dst);
-    gst_element_link (selector, dst);
+  self->compositor_sink_pad = compositor_sink_pad;
+  g_object_ref(self->compositor_sink_pad);
 
-    res = gst_element_factory_make ("intervideosrc", "screencastsrc");
-    if (!res)
-        g_error ("Error creating intervideosrc, missing dependency!");
-    g_object_set (res,
-                  "do-timestamp", FALSE,
-                  "timeout", (guint64)G_MAXUINT64,
-                  "channel", "nd-inter-video",
-                  NULL);
-    gst_bin_add (bin, res);
+  src_pad = gst_element_get_static_pad(filter, "src");
+  if (gst_pad_link(src_pad, compositor_sink_pad) != GST_PAD_LINK_OK)
+    g_error("Failed to link filter -> compositor");
+  gst_object_unref(src_pad);
+  gst_object_unref(compositor_sink_pad);
 
-    gst_element_add_pad (GST_ELEMENT(bin),
-                         gst_ghost_pad_new("src",
-                                           gst_element_get_static_pad(res, "src")));
+  sink_elem = gst_element_factory_make("intervideosink", "intervideosink");
+  if (!sink_elem)
+    g_error("Failed to create intervideosink");
 
-    g_object_ref_sink (bin);
-    return GST_ELEMENT(bin);
+  g_object_set(sink_elem, "channel", "nd-inter-video", "max-lateness", (gint64)-1, "sync", FALSE, NULL);
+  gst_bin_add(bin, sink_elem);
+
+  if (!gst_element_link(compositor, sink_elem))
+    g_error("Failed to link compositor -> intervideosink");
+
+  src_out = gst_element_factory_make("intervideosrc", "screencastsrc");
+  g_object_set(src_out, "do-timestamp", FALSE, "timeout", (guint64)G_MAXUINT64, "channel", "nd-inter-video", NULL);
+  gst_bin_add(bin, src_out);
+  
+  GstPad *ghost_src = gst_element_get_static_pad(src_out, "src");
+  gst_element_add_pad(GST_ELEMENT(bin), gst_ghost_pad_new("src", ghost_src));
+  gst_object_unref(ghost_src);
+
+  g_object_ref_sink(bin);
+  return GST_ELEMENT(bin);
 }
 
 static GstElement *
