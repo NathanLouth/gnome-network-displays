@@ -55,6 +55,8 @@ struct _NdWindow
 
   GPtrArray             *sink_property_bindings;
 
+  GstPad                *compositor_sink_pad;
+
   /* Template widgets */
   GtkStack        *has_providers_stack;
   GtkStack        *step_stack;
@@ -81,6 +83,8 @@ struct _NdWindow
   GListStore      *error_sink_list_model;
   GtkBox          *error_firewall_zone;
   GtkButton       *error_return;
+
+  GtkButton       *hide_screen_button;
 };
 
 G_DEFINE_TYPE (NdWindow, gnome_nd_window, ADW_TYPE_APPLICATION_WINDOW)
@@ -142,7 +146,8 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
 {
   g_autoptr(GstCaps) caps = NULL;
   GstBin *bin;
-  GstElement *src, *filter, *dst, *res;
+  GstElement *src, *filter, *compositor, *sink_elem, *res;
+  GstPad *compositor_sink_pad, *src_pad;
 
   bin = GST_BIN (gst_bin_new ("screencast source bin"));
   g_debug ("use x11: %d", self->use_x11);
@@ -155,16 +160,6 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
     g_error ("Error creating video source element, likely a missing dependency!");
 
   gst_bin_add (bin, src);
-
-  dst = gst_element_factory_make ("intervideosink", "inter video sink");
-  if (!dst)
-    g_error ("Error creating intervideosink, missing dependency!");
-  g_object_set (dst,
-                "channel", "nd-inter-video",
-                "max-lateness", (gint64) - 1,
-                "sync", FALSE,
-                NULL);
-  gst_bin_add (bin, dst);
 
   if (self->screencast_type == ND_SCREEN_CAST_SOURCE_TYPE_VIRTUAL)
     {
@@ -181,10 +176,47 @@ sink_create_source_cb (NdWindow * self, NdSink * sink)
                     NULL);
       g_clear_pointer (&caps, gst_caps_unref);
 
-      gst_element_link_many (src, filter, dst, NULL);
-    }
-  else
-    gst_element_link_many (src, dst, NULL);
+      if (!gst_element_link(src, filter))
+        g_error("Failed to link src -> capsfilter");
+    } 
+    else
+      filter = src;
+
+  compositor = gst_element_factory_make("compositor", "compositor");
+  if (!compositor)
+    g_error("Failed to create compositor. Is it installed?");
+  gst_bin_add(bin, compositor);
+
+    g_object_set(compositor,
+                 "background", 1,
+                 NULL);
+
+  compositor_sink_pad = gst_element_get_request_pad(compositor, "sink_%u");
+  if (!compositor_sink_pad)
+    g_error("Failed to get sink pad from compositor");
+
+  self->compositor_sink_pad = compositor_sink_pad;
+  g_object_ref(self->compositor_sink_pad);
+
+  src_pad = gst_element_get_static_pad(filter, "src");
+  if (gst_pad_link(src_pad, compositor_sink_pad) != GST_PAD_LINK_OK)
+    g_error("Failed to link filter -> compositor");
+  gst_object_unref(src_pad);
+  gst_object_unref(compositor_sink_pad);
+
+  sink_elem = gst_element_factory_make ("intervideosink", "intervideosink");
+  if (!sink_elem)
+    g_error("Failed to create intervideosink");
+
+  g_object_set (sink_elem,
+                "channel", "nd-inter-video",
+                "max-lateness", (gint64) - 1,
+                "sync", FALSE,
+                NULL);
+  gst_bin_add(bin, sink_elem);
+
+  if (!gst_element_link(compositor, sink_elem))
+    g_error("Failed to link compositor -> intervideosink");
 
   res = gst_element_factory_make ("intervideosrc", "screencastsrc");
   g_object_set (res,
@@ -215,6 +247,31 @@ sink_create_audio_source_cb (NdWindow * self, NdSink * sink)
   res = nd_pulseaudio_get_source (self->pulse);
 
   return g_object_ref_sink (res);
+}
+
+static void
+hide_screen_button_clicked_cb(NdWindow *self)
+{
+    const gchar *current_label = gtk_button_get_label(self->hide_screen_button);
+
+    if (!self->compositor_sink_pad) {
+        g_warning("No compositor sink pad available");
+        return;
+    }
+
+    if (g_strcmp0(current_label, _("Hide Screen")) == 0) {
+        gtk_button_set_label(self->hide_screen_button, _("Restore Screen"));
+        g_debug("nd-window: Screen Hidden");
+        g_object_set(self->compositor_sink_pad,
+                     "alpha", 0.0,
+                     NULL);
+    } else {
+        gtk_button_set_label(self->hide_screen_button, _("Hide Screen"));
+        g_debug("nd-window: Screen Restored");
+        g_object_set(self->compositor_sink_pad,
+                     "alpha", 1.0,
+                     NULL);
+    }
 }
 
 static void
@@ -571,6 +628,7 @@ gnome_nd_window_class_init (NdWindowClass *klass)
   gtk_widget_class_bind_template_child (widget_class, NdWindow, error_sink_list);
   gtk_widget_class_bind_template_child (widget_class, NdWindow, error_firewall_zone);
   gtk_widget_class_bind_template_child (widget_class, NdWindow, error_return);
+  gtk_widget_class_bind_template_child (widget_class, NdWindow, hide_screen_button);
 }
 
 static void
@@ -688,6 +746,12 @@ gnome_nd_window_init (NdWindow *self)
                            (GCallback) stream_stop_clicked_cb,
                            self,
                            G_CONNECT_SWAPPED);
+
+  g_signal_connect_object(self->hide_screen_button,
+                            "clicked",
+                            G_CALLBACK(hide_screen_button_clicked_cb),
+                            self,
+                            G_CONNECT_SWAPPED);
 
   self->portal = xdp_portal_initable_new (&error);
   if (error)
