@@ -9,9 +9,7 @@ gnome_nd_common_sources = [
   'nd-meta-sink.c',
   'nd-meta-provider.c',
   'nd-wfd-mice-sink.c',
-  'nd-wfd-mice-provider.c',
   'nd-cc-sink.c',
-  'nd-cc-provider.c',
   'nd-wfd-p2p-sink.c',
   'nd-wfd-p2p-provider.c',
   'nd-nm-device-registry.c',
@@ -22,6 +20,22 @@ gnome_nd_common_sources = [
   'nd-uri-helpers.c',
 ]
 
+systemd_sources = [
+  'nd-sd-wfd-mice-provider.c',
+  'nd-sd-cc-provider.c',
+]
+
+avahi_sources = [
+  'nd-wfd-mice-provider.c',
+  'nd-cc-provider.c',
+]
+
+if get_option('systemd_resolved')
+  gnome_nd_common_sources += systemd_sources
+else
+  gnome_nd_common_sources += avahi_sources
+endif
+
 enum_headers = files('nd-sink.h')
 
 gnome_nd_common_sources += gnome.mkenums_simple(
@@ -30,19 +44,28 @@ gnome_nd_common_sources += gnome.mkenums_simple(
 )
 
 gnome_nd_common_deps = [
-  dependency('avahi-client'),
-  dependency('avahi-gobject'),
   dependency('gio-2.0', version: '>= 2.50'),
   dependency('gstreamer-1.0', version: '>= 1.14'),
   dependency('gstreamer-pbutils-1.0', version: '>= 1.14'),
   dependency('gstreamer-plugins-base-1.0'),
   dependency('gstreamer-rtsp-server-1.0'),
-  dependency('gtk4'),
+  dependency('gtk4', version: '>= 4.13.0'),
   dependency('libnm', version: '>= 1.15'),
   dependency('libportal-gtk4', version: '>= 0.7'),
   dependency('libpulse-mainloop-glib'),
-  dependency('libadwaita-1', version: '>= 1.0.0'),
+  dependency('libadwaita-1', version: '>= 1.6.0'),
 ]
+
+if get_option('systemd_resolved')
+  gnome_nd_common_deps += [
+    dependency('libsystemd', version: '>=259')
+  ]
+else
+  gnome_nd_common_deps += [
+    dependency('avahi-client'),
+    dependency('avahi-gobject'),
+  ]
+endif
 
 gnome_nd_common_deps += wfd_server_deps
 gnome_nd_common_deps += cc_deps

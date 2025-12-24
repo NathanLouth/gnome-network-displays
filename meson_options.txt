@@ -12,3 +12,8 @@ option('build_app',
        type: 'boolean',
        value: true,
        description: 'Build a graphical client app')
+
+option('systemd_resolved',
+       type: 'boolean',
+       value: false,
+       description: 'Enable systemd-resolved based mDNS discovery')
